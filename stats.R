@@ -73,7 +73,11 @@ max <- new_creek_long %>%
   
   summarize(yearly_max = max(value, na.rm = TRUE))
 
+#                  Save both dfs as csv files                 ~~~
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+st_write(ssm, here("data", "summaries", "ssm.geojson"))
+st_write(max, here("data", "summaries", "max.geojson"))
 
 
 
