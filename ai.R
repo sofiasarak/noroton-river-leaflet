@@ -4,18 +4,19 @@ library(sf)
 library(here)
 library(plotly)
 
-# read in data
+#                        Read in data                         ~~~
+#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 # new creek geometry
 new_creek_geo <- read_sf(here("data", "new_creek.geojson")) 
 
-# transform new_creek geo to leaflet projection
-new_creek_geo <- st_transform(new_creek_geo, crs = '+proj=longlat +datum=WGS84')
-
 # read in summary data (yearly number of times ssm was exceeded and max)
 ssm <- read_sf(here("data", "summaries", "ssm.geojson"))
-# add long and lat coords back in (are currently stored as geometries)
-ssm <- cbind(ssm, st_coordinates(ssm))
+
+# add long and lat coords back in as distinct columns (are currently stored as geometries)
+ssm <- cbind(ssm, st_coordinates(ssm)) %>% 
+  st_transform(crs = st_crs(new_creek_geo))
+
 
 #                  Segmentize New Creek Geo                   ~~~
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -23,120 +24,108 @@ ssm <- cbind(ssm, st_coordinates(ssm))
 # create one single linestring feature from geometry
 new_creek_seg <- st_segmentize(new_creek_geo, dfMaxLength = 50)
 
-## break into individual 2-point segments
-# creates coordinates from the linestring we created
-coords <- st_coordinates(ssm)[, 1:2]
-
-# takes all the coordinates and makes them into their own, little linestrings (line between each two coords)
-segs <- lapply(1:(nrow(coords) - 1), function(i) st_linestring(coords[i:(i+1), ]))
-
-# create an sf object from those little linestrings, using the same CRS a our original geo
-segs <- st_sf(geometry = st_sfc(segs, crs = st_crs(new_creek_geo)))
-
-# calculate midpoint of each tiny linestring (stored as a matrix, NOT an sf object yet)
-mid_coords <- (coords[-nrow(coords), ] + coords[-1, ]) / 2
-
-# use the midpoints, and create sf objects from them (using st_point)
-mids <- st_sf(geometry = st_sfc(lapply(1:nrow(mid_coords), function(i)
-  st_point(mid_coords[i, ])), crs = st_crs(new_creek_geo)))
-
-# find the nearest sample to the midpoints
-nearest <- st_nearest_feature(mids, ssm)
-
-# add a column for bacteria concentration based on the index of the nearest sample site
-segs$conc <- ssm$times_exceeded[nearest]
+# extract the coordinates along the entire line segment
+new_creek_coords <- sf::st_coordinates(new_creek_geo) %>% as.data.frame() %>% 
+  
+  # convert coordinates to an sf object
+  st_as_sf(coords = c("X", "Y"), crs = st_crs(new_creek_geo)) 
 
 
-#                    Prepare for plotting                     ~~~
+#        Find nearest site for each segment/coordinate        ~~~
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# create list of years
-years <- sort(unique(ssm$year))
+# for loop based on year
+years <- unique(ssm$year) # save list of years
 
-# assign color palette
-pal <- colorFactor(rev(RColorBrewer::brewer.pal(10, "RdBu")), domain = 1:10)
+# create empty list of dfs to combine later
+dflist <- list()
 
-# identify the nearest
-nearest_sites <- st_nearest_feature(mids, ssm[ssm$year == years[1], ])
+for (i in 1:length(years)){
+  
+  # take only the rows of the df that correspond to that year
+  filtered <- ssm %>% filter(year == years[i])
+  
+  # # find the nearest sample to the midpoints; for each mid, the nearest point in ssm
+  # nearest now has indices of ssm that match up to new_creek_coords
+  nearest <- st_nearest_feature(new_creek_coords, filtered)
+  
+  # create temporary coords df (used for appending)
+  new_creek_coords_temp <- new_creek_coords
+  
+  # add a column for bacteria concentration based on the index of the nearest sample site
+  new_creek_coords_temp$percent_exceeded <- filtered$percent_exceeded[nearest]
+  
+  # add column for which site it corresponds to
+  new_creek_coords_temp$site <- filtered$site[nearest]
+  
+  # add coordinates as columns, alongside year
+  new_creek_coords_temp <- cbind(new_creek_coords_temp, st_coordinates(new_creek_coords_temp), year = years[i])
+  
+  # append the temporary coord df to the empty list
+  dflist[[i]] <- new_creek_coords_temp
+
+}
+
+# combine list of temporary data frames into one (long format)
+new_creek_coords <- do.call(rbind, dflist)
+
 
 #                            Plot                             ~~~
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# initialize plot
+# initialize plotly
 plot <- plot_ly()
 
-for (yr in years) {
-  
-  # for each year, find where the 
-  samples_yr <- ssm[ssm$year == yr, ]
-  conc <- samples_yr$times_exceeded[match(nearest_sites, samples_yr$site)]
-  
-  for (i in seq_len(nrow(coords) - 1)) {
-    seg <- coords[i:(i + 1), ]
-    plot <- plot |>
-      add_trace(
-        type = "scattermapbox", mode = "lines",
-        lat = seg[, 2], lon = seg[, 1],
-        line = list(color = pal(conc[i]), width = 4),
-        frame = yr,
-        showlegend = FALSE,
-        hoverinfo = "skip"
-      )
-  }
-}
+## RIVER GEO (LINE)
 
-plot <- plot_ly() %>% 
-  
-  # first layer are all points plotted as gray and slightly larger as colored points
-  # this creates an outline
-  add_trace(
-    data = ssm,
-    lat = ~Y, lon = ~X,
-    frame = ~year,
-    type = "scattermapbox",
-    mode = "markers",
-    marker = list(
-      size = 18,               # larger size to create a 2px "outline"
-      color = "DarkSlateGrey"  # border color
-    ),
-    showlegend = FALSE
-  )  %>%
-  
-  # plot sampling sites on top, colored by the number of times they exceeded ssm
-  add_trace(
-    data = ssm,
-    lat = ~Y, lon = ~X,
-    frame = ~year,
-    type = "scattermapbox",
-    mode = "markers",
-    marker = list(size = 14,
-                  color = pal(conc[i])),
+plot <- plot %>%
+  add_trace(data = new_creek_coords,
+            lat = ~Y, lon = ~X,
+            split = ~site, # treats segments differently based on the site they correspond to
+            frame = ~year,
+            color = ~percent_exceeded, # color by perc site exceeded ssm
+            type = "scattermapbox", mode = "lines",
+            line = list(width = 3), # adjust width
+            showlegend = FALSE, hoverinfo = "skip",
+            showscale = FALSE) # tried to get rid of second "percent_exceeded" - might have to make static legend
 
-    # adds text when hovering over marker
-    text = ~paste0("<b>", site, "</b><br>Times Exceeded SSM: ", times_exceeded),
-    hoverinfo = "text",
-    showlegend = FALSE
-  )
+## OUTLINE POINTS 
+# add dark gray outline to markers
 
-# create static legend
-for (lvl in 1:10) {
-  plot <- plot %>% 
-    
-    # add a new marker for each level of the palette
-    add_trace(
-      lat = 0, lon = 0,          # dummy coord, marker hidden via opacity
-      type = "scattermapbox",
-      mode = "markers",
-      marker = list(size = 14, color = pal(conc[i])),
-      name = as.character(lvl),
-      showlegend = TRUE,
-      hoverinfo = "skip"
-    )
-}
+plot <- plot |>
+  add_trace(data = ssm, lat = ~Y, lon = ~X, frame = ~year,
+            type = "scattermapbox", mode = "markers",
+            marker = list(size = 18, color = "DarkSlateGrey"),
+            showlegend = FALSE)
+
+## SAMPLING POINTS
+# add markers that change color based on perc exceeded (similar to lines)
+
+plot <- plot |>
+  add_trace(data = ssm, lat = ~Y, lon = ~X, frame = ~year,
+            type = "scattermapbox", mode = "markers",
+            color = ~percent_exceeded,
+            colors = colorRamp(c("white", "darkred")), # colormap does not work :(
+            marker = list(size = 14),
+            
+            # add hover
+            text = ~paste0("<b>", site, "</b><br>% Exceeded SSM: ", percent_exceeded),
+            hoverinfo = "text", showlegend = FALSE)
+
+
+# legend
+# for (lvl in 1:10) {
+#   plot <- plot |>
+#     add_trace(lat = 0, lon = 0, type = "scattermapbox", mode = "markers",
+#               marker = list(size = 14, color = ~percent_exceeded, colors = "Reds"),
+#               name = as.character(lvl), showlegend = TRUE, hoverinfo = "skip")
+# }
+
+## BACKGROUND, BASEMAP
 
 plot <- plot %>% 
   layout(
-    title = "New Creek: Number of Times SSM Exceeded at Each Site (2023-2025)",
+    title = "New Creek: % of Times SSM Exceeded",
     
     # add plot spacing
     margin = list(
@@ -162,72 +151,5 @@ plot <- plot %>%
   animation_opts(frame = 1000)
 
 # call plot
-plot
-
-# lines (unchanged, but keep result in `plot`)
-plot <- plot_ly()
-for (yr in years) {
-  samples_yr <- ssm[ssm$year == yr, ]
-  conc <- samples_yr$times_exceeded[nearest]
-  for (i in seq_len(nrow(coords) - 1)) {
-    seg <- coords[i:(i + 1), ]
-    plot <- plot |>
-      add_trace(type = "scattermapbox", mode = "lines",
-                lat = seg[, 2], lon = seg[, 1],
-                line = list(color = rev(pal(conc[i])), width = 4),
-                frame = yr, showlegend = FALSE, hoverinfo = "skip")
-  }
-}
-
-# outline points — chain onto same `plot`
-plot <- plot |>
-  add_trace(data = ssm, lat = ~Y, lon = ~X, frame = ~year,
-            type = "scattermapbox", mode = "markers",
-            marker = list(size = 18, color = "DarkSlateGrey"),
-            showlegend = FALSE)
-
-# colored points — per-row color, chain onto same `plot`
-plot <- plot |>
-  add_trace(data = ssm, lat = ~Y, lon = ~X, frame = ~year,
-            type = "scattermapbox", mode = "markers",
-            marker = list(size = 14, color = ~pal(times_exceeded)),
-            text = ~paste0("<b>", site, "</b><br>Times Exceeded SSM: ", times_exceeded),
-            hoverinfo = "text", showlegend = FALSE)
-
-# legend
-for (lvl in 1:10) {
-  plot <- plot |>
-    add_trace(lat = 0, lon = 0, type = "scattermapbox", mode = "markers",
-              marker = list(size = 14, color = pal(lvl)),
-              name = as.character(lvl), showlegend = TRUE, hoverinfo = "skip")
-}
-
-plot <- plot %>% 
-  layout(
-    title = "New Creek: Number of Times SSM Exceeded at Each Site (2023-2025)",
-    
-    # add plot spacing
-    margin = list(
-      t = 150,  
-      b = 50,  
-      l = 50,   
-      r = 50   
-    ),
-    
-    # set basemap, initial zoom
-    mapbox = list(
-      style = "open-street-map",
-      center = list(lat = 41.12076, lon = -73.3151),
-      zoom = 13
-    ),
-    
-    # background color and font color
-    paper_bgcolor = "white",
-    font = list(color = "black")
-  ) %>% 
-  
-  # changes speed of animation when "play" is hit
-  animation_opts(frame = 1000)
-
 plot
 
